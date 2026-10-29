@@ -112,6 +112,7 @@ type config struct {
 	queueHandshakeSize         int
 	preallocatedBuffersPerPool uint32
 	metrics                    Metrics
+	senderPinning              bool
 }
 
 func defaultConfig() config {
@@ -212,6 +213,16 @@ type Metrics struct {
 	// MessageTransportRXDroppedReplay counts inbound transport packets rejected by the
 	// replay filter.
 	MessageTransportRXDroppedReplay Counter
+	// SenderPins counts peer senders pinned to a CPU. See [WithSenderPinning].
+	SenderPins Counter
+	// SenderUnpins counts peer senders unpinned again, including at peer
+	// shutdown. SenderPins minus SenderUnpins is the number pinned now.
+	SenderUnpins Counter
+	// SenderRepins counts pinned senders that found their affinity reset,
+	// because the cpuset changed, and pinned themselves again.
+	SenderRepins Counter
+	// SenderPinErrors counts failed pin, check and unpin attempts.
+	SenderPinErrors Counter
 }
 
 // noopCounter is a noop implementation of [Counter].
@@ -242,12 +253,36 @@ func (m *Metrics) fillNils() {
 	if m.MessageTransportRXDroppedReplay == nil {
 		m.MessageTransportRXDroppedReplay = noopCounter{}
 	}
+	if m.SenderPins == nil {
+		m.SenderPins = noopCounter{}
+	}
+	if m.SenderUnpins == nil {
+		m.SenderUnpins = noopCounter{}
+	}
+	if m.SenderRepins == nil {
+		m.SenderRepins = noopCounter{}
+	}
+	if m.SenderPinErrors == nil {
+		m.SenderPinErrors = noopCounter{}
+	}
 }
 
 // WithMetrics sets the provided [Metrics] to be used at instrumentation points.
 func WithMetrics(metrics Metrics) Option {
 	return optionFunc(func(config *config) {
 		config.metrics = metrics
+	})
+}
+
+// WithSenderPinning pins each peer's sequential sender to one CPU while the
+// peer is sending at a high rate, so that on a Linux host with a multi-queue
+// NIC the peer's packets leave through one transmit queue, in order, instead
+// of being spread over every queue by the CPU the sender happens to run on.
+// The sender unpins itself after a minute at a low rate. It has no effect on
+// other platforms. See pin.go for the mechanism and the rates.
+func WithSenderPinning(enabled bool) Option {
+	return optionFunc(func(config *config) {
+		config.senderPinning = enabled
 	})
 }
 

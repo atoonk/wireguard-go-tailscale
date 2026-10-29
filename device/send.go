@@ -640,8 +640,93 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 
 	bufs := make([][]byte, 0, maxBatchSize)
 
-	for elemsContainer := range peer.queue.outbound {
-		peer.processOutboundContainer(elemsContainer, bufs[:0])
+	if !(senderPinSupported && device.config.senderPinning) {
+		for elemsContainer := range peer.queue.outbound {
+			peer.processOutboundContainer(elemsContainer, bufs[:0])
+		}
+		return
+	}
+	peer.sequentialSenderPinning(bufs)
+}
+
+// sequentialSenderPinning is RoutineSequentialSender's loop with sender
+// pinning (see pin.go). The send rate is judged every pinSenderWindow. While
+// pinned a ticker keeps judging through idle periods, so that an idle peer
+// is unpinned instead of holding its thread until its next packet.
+func (peer *Peer) sequentialSenderPinning(bufs [][]byte) {
+	device := peer.device
+	metrics := &device.config.metrics
+	var (
+		pin    senderPin
+		cpu    int // the CPU pinned to, for the log
+		judge  = newSenderPinJudge(time.Now())
+		ticker *time.Ticker
+		tick   <-chan time.Time // nil, so never ready, while unpinned
+	)
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+		if !judge.pinned {
+			return
+		}
+		if err := pin.unpin(); err != nil {
+			metrics.SenderPinErrors.Add(1)
+			device.log.Errorf("%v - sender unpin failed: %v", peer, err)
+			return
+		}
+		metrics.SenderUnpins.Add(1)
+	}()
+	for {
+		select {
+		case elemsContainer, ok := <-peer.queue.outbound:
+			if !ok {
+				return
+			}
+			judge.add(peer.processOutboundContainer(elemsContainer, bufs[:0]))
+		case <-tick:
+		}
+		now := time.Now()
+		action, rate := judge.judge(now)
+		switch action {
+		case senderPinDo:
+			var err error
+			cpu, err = pin.pin()
+			if err != nil {
+				metrics.SenderPinErrors.Add(1)
+				device.log.Errorf("%v - sender pin failed: %v", peer, err)
+				continue
+			}
+			judge.setPinned(true)
+			ticker = time.NewTicker(pinSenderWindow)
+			tick = ticker.C
+			metrics.SenderPins.Add(1)
+			device.log.Verbosef("%v - sender pinned to CPU %d at %.0f Mbit/s", peer, cpu, rate/1e6)
+		case senderPinCheck:
+			repinned, newCPU, err := pin.check()
+			if err != nil {
+				metrics.SenderPinErrors.Add(1)
+				device.log.Errorf("%v - sender pin check failed: %v", peer, err)
+				continue
+			}
+			if repinned {
+				cpu = newCPU
+				metrics.SenderRepins.Add(1)
+				device.log.Verbosef("%v - sender affinity was reset, pinned again to CPU %d", peer, cpu)
+			}
+		case senderPinUndo:
+			if err := pin.unpin(); err != nil {
+				metrics.SenderPinErrors.Add(1)
+				device.log.Errorf("%v - sender unpin failed, thread stays pinned to CPU %d: %v", peer, cpu, err)
+				judge.deferUnpin(now)
+				continue
+			}
+			judge.setPinned(false)
+			ticker.Stop()
+			ticker, tick = nil, nil
+			metrics.SenderUnpins.Add(1)
+			device.log.Verbosef("%v - sender unpinned from CPU %d: under %.1f Mbit/s for %v", peer, cpu, float64(unpinSenderRate)/1e6, unpinSenderAfter)
+		}
 	}
 }
 
@@ -650,8 +735,9 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 // has been stopped) and returns the container to the pool.
 //
 // scratch is a length-0 slice used to assemble the per-packet buffers
-// passed to SendBuffers; its backing array is reused across calls.
-func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElementsContainer, scratch [][]byte) {
+// passed to SendBuffers; its backing array is reused across calls. It
+// returns the number of encapsulated bytes handed to the bind.
+func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElementsContainer, scratch [][]byte) (sent int64) {
 	// Invariants from RoutineSequentialSender; all should be unreachable.
 	if len(scratch) != 0 || cap(scratch) == 0 {
 		panic(fmt.Sprintf("processOutboundContainer: scratch must be empty with non-zero cap; got len=%d cap=%d",
@@ -689,6 +775,7 @@ func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElements
 			dataSent = true
 		}
 		scratch = append(scratch, elem.packet)
+		sent += int64(len(elem.packet))
 	}
 
 	peer.timersAnyAuthenticatedPacketTraversal()
@@ -714,4 +801,5 @@ func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElements
 	}
 
 	peer.keepKeyFreshSending()
+	return sent
 }
